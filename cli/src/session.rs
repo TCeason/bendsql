@@ -63,7 +63,12 @@ pub struct Session {
 }
 
 impl Session {
-    pub async fn try_new(dsn: String, settings: Settings, is_repl: bool) -> Result<Self> {
+    pub async fn try_new(
+        dsn: String,
+        settings: Settings,
+        is_repl: bool,
+        no_auto_load_prompt: bool,
+    ) -> Result<Self> {
         let client = Client::new(dsn).with_name(format!("bendsql/{}", VERSION_SHORT.as_str()));
         let conn = client.get_conn().await?;
         let info = conn.info().await;
@@ -88,16 +93,18 @@ impl Session {
             println!("Connected to {}", version);
             println!();
 
-            let rows = conn.query_iter(PROMPT_SQL).await;
-            match rows {
-                Ok(mut rows) => {
-                    while let Some(row) = rows.next().await {
-                        let name: (String,) = row.unwrap().try_into().unwrap();
-                        keywords.push(name.0);
+            if !no_auto_load_prompt {
+                let rows = conn.query_iter(PROMPT_SQL).await;
+                match rows {
+                    Ok(mut rows) => {
+                        while let Some(row) = rows.next().await {
+                            let name: (String,) = row.unwrap().try_into().unwrap();
+                            keywords.push(name.0);
+                        }
                     }
-                }
-                Err(e) => {
-                    eprintln!("loading auto complete keywords failed: {}", e);
+                    Err(e) => {
+                        eprintln!("loading auto complete keywords failed: {}", e);
+                    }
                 }
             }
         }

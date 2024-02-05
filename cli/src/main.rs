@@ -184,6 +184,13 @@ struct Args {
 
     #[clap(short = 'r', long, help = "Downgrade role name")]
     role: Option<String>,
+
+    #[clap(
+        short = 'A',
+        long,
+        help = "No automatic load keyword. This gives a quicker start of databend-query."
+    )]
+    no_auto_load_prompt: bool,
 }
 
 /// Parse a single key-value pair
@@ -311,7 +318,8 @@ pub async fn main() -> Result<()> {
     }
     settings.time = args.time;
 
-    let mut session = session::Session::try_new(dsn, settings, is_repl).await?;
+    let mut session =
+        session::Session::try_new(dsn, settings, is_repl, args.no_auto_load_prompt).await?;
 
     let log_dir = format!(
         "{}/.bendsql",
