@@ -129,172 +129,18 @@ impl SqlParser {
         let parsed = self.parse_statements(query_buffer);
 
         *err = parsed.err;
-        // Update the buffer with remaining text
         *query_buffer = parsed.remaining;
 
-        // Return complete statements
         parsed.statements
-    }
-
-    /// Find the byte offset where an unclosed block comment (`/*`) begins.
-    /// Returns `None` if all block comments are properly closed.
-    /// Skips `--` line comments, `$$` dollar-quoted strings, and respects
-    /// single/double-quoted string literals.
-    /// Block comments are non-nested (matches tokenizer behaviour): the
-    /// first `*/` always closes the comment.
-    fn unclosed_block_comment_start(s: &str) -> Option<usize> {
-        let mut in_block_comment = false;
-        let mut open_pos = None;
-        let mut in_single_quote = false;
-        let mut in_double_quote = false;
-        let mut in_dollar_quote = false;
-        let mut in_line_comment = false;
-        let bytes = s.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            let c = bytes[i];
-
-            // Newline resets line-comment state.
-            if c == b'\n' {
-                in_line_comment = false;
-                i += 1;
-                continue;
-            }
-            if in_line_comment {
-                i += 1;
-                continue;
-            }
-
-            // Inside a block comment, only look for `*/`.
-            if in_block_comment {
-                if c == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-                    in_block_comment = false;
-                    open_pos = None;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-                continue;
-            }
-
-            // Inside a dollar-quoted string, only look for `$$`.
-            if in_dollar_quote {
-                if c == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'$' {
-                    in_dollar_quote = false;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-                continue;
-            }
-
-            match c {
-                b'\'' if !in_double_quote => in_single_quote = !in_single_quote,
-                b'"' if !in_single_quote => in_double_quote = !in_double_quote,
-                b'$' if !in_single_quote
-                    && !in_double_quote
-                    && i + 1 < bytes.len()
-                    && bytes[i + 1] == b'$' =>
-                {
-                    in_dollar_quote = true;
-                    i += 2;
-                    continue;
-                }
-                b'-' if !in_single_quote
-                    && !in_double_quote
-                    && i + 1 < bytes.len()
-                    && bytes[i + 1] == b'-' =>
-                {
-                    in_line_comment = true;
-                    i += 2;
-                    continue;
-                }
-                b'/' if !in_single_quote
-                    && !in_double_quote
-                    && i + 1 < bytes.len()
-                    && bytes[i + 1] == b'*' =>
-                {
-                    in_block_comment = true;
-                    open_pos = Some(i);
-                    i += 2;
-                    continue;
-                }
-                _ => {}
-            }
-            i += 1;
-        }
-        if in_block_comment {
-            open_pos
-        } else {
-            None
-        }
     }
 
     /// Parse accumulated query text to extract complete statements
     fn parse_statements(&self, query: &str) -> ParseResult {
-        // Split off the unclosed block-comment tail so the tokenizer only
-        // sees text it can handle.  Statements before the `/*` are still
-        // extracted normally; the comment portion stays in `remaining`.
-        let (to_parse, comment_tail) = match Self::unclosed_block_comment_start(query) {
-            Some(pos) => (&query[..pos], &query[pos..]),
-            None => (query, ""),
-        };
-
-        let mut statements = Vec::new();
-        let mut remaining_query = to_parse.to_string();
-        let mut err = String::new();
-
-        'Parser: loop {
-            let mut is_valid = true;
-            let tokenizer = Tokenizer::new(&remaining_query);
-            let mut previous_token_backslash = false;
-
-            for token in tokenizer {
-                match token {
-                    Ok(token) => {
-                        // SQL end with `;` or `\G` in repl
-                        let is_end_query = token.text() == self.delimiter.to_string();
-                        let is_slash_g = self.is_repl
-                            && (previous_token_backslash
-                                && token.kind == TokenKind::Ident
-                                && token.text() == "G")
-                            || (token.text().ends_with("\\G"));
-
-                        if is_end_query || is_slash_g {
-                            // Extract the statement and continue with remaining text
-                            let (sql, remain) = remaining_query.split_at(token.span.end as usize);
-                            if is_valid
-                                && !sql.is_empty()
-                                && sql.trim() != self.delimiter.to_string()
-                            {
-                                let sql = sql.trim_end_matches(self.delimiter);
-                                statements.push(sql.trim().to_string());
-                            }
-                            remaining_query = remain.to_string();
-                            continue 'Parser;
-                        }
-                        previous_token_backslash = matches!(token.kind, TokenKind::Backslash);
-                    }
-                    Err(e) => {
-                        // ignore current query if have invalid token.
-                        is_valid = false;
-                        err = e.to_string();
-                        continue;
-                    }
-                }
-            }
-            break;
-        }
-
-        // Re-attach the unclosed comment tail so it keeps accumulating.
-        if !comment_tail.is_empty() {
-            remaining_query.push_str(comment_tail);
-        }
-
+        let split = split_statements(query, self.delimiter, self.is_repl);
         ParseResult {
-            statements,
-            remaining: remaining_query,
-            err,
+            statements: split.statements,
+            remaining: split.remaining,
+            err: split.err,
         }
     }
 }
@@ -305,8 +151,389 @@ struct ParseResult {
     err: String,
 }
 
+struct SplitResult {
+    statements: Vec<String>,
+    remaining: String,
+    err: String,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum TailState {
+    Normal,
+    SingleQuote(usize),
+    DoubleQuote(usize),
+    Backtick(usize),
+    DollarQuote(usize),
+    BlockComment(usize),
+    LineComment,
+}
+
+fn unfinished_tail_start(s: &str) -> Option<usize> {
+    let mut chars = s.char_indices().peekable();
+    let mut state = TailState::Normal;
+
+    while let Some((idx, ch)) = chars.next() {
+        match state {
+            TailState::Normal => match ch {
+                '\'' => state = TailState::SingleQuote(idx),
+                '"' => state = TailState::DoubleQuote(idx),
+                '`' => state = TailState::Backtick(idx),
+                '-' if matches!(chars.peek(), Some((_, '-'))) => {
+                    chars.next();
+                    state = TailState::LineComment;
+                }
+                '/' if matches!(chars.peek(), Some((_, '*'))) => {
+                    chars.next();
+                    state = TailState::BlockComment(idx);
+                }
+                '$' if matches!(chars.peek(), Some((_, '$'))) => {
+                    chars.next();
+                    state = TailState::DollarQuote(idx);
+                }
+                _ => {}
+            },
+            TailState::SingleQuote(_) => match ch {
+                '\\' => {
+                    chars.next();
+                }
+                '\'' if matches!(chars.peek(), Some((_, '\''))) => {
+                    chars.next();
+                }
+                '\'' => state = TailState::Normal,
+                _ => {}
+            },
+            TailState::DoubleQuote(_) => match ch {
+                '\\' => {
+                    chars.next();
+                }
+                '"' if matches!(chars.peek(), Some((_, '"'))) => {
+                    chars.next();
+                }
+                '"' => state = TailState::Normal,
+                _ => {}
+            },
+            TailState::Backtick(_) => {
+                if ch == '`' {
+                    state = TailState::Normal;
+                }
+            }
+            TailState::DollarQuote(_) => {
+                if ch == '$' && matches!(chars.peek(), Some((_, '$'))) {
+                    chars.next();
+                    state = TailState::Normal;
+                }
+            }
+            TailState::BlockComment(_) => {
+                if ch == '*' && matches!(chars.peek(), Some((_, '/'))) {
+                    chars.next();
+                    state = TailState::Normal;
+                }
+            }
+            TailState::LineComment => {
+                if matches!(ch, '\n' | '\u{000C}') {
+                    state = TailState::Normal;
+                }
+            }
+        }
+    }
+
+    match state {
+        TailState::SingleQuote(start)
+        | TailState::DoubleQuote(start)
+        | TailState::Backtick(start)
+        | TailState::DollarQuote(start)
+        | TailState::BlockComment(start) => Some(start),
+        TailState::Normal | TailState::LineComment => None,
+    }
+}
+
+fn split_statements(s: &str, delimiter: char, is_repl: bool) -> SplitResult {
+    let (to_parse, tail) = match unfinished_tail_start(s) {
+        Some(pos) => (&s[..pos], &s[pos..]),
+        None => (s, ""),
+    };
+
+    let delimiter_text = delimiter.to_string();
+    let mut statements = Vec::new();
+    let mut remaining_query = to_parse.to_string();
+    let mut err = String::new();
+
+    'parser: loop {
+        let mut tokenizer = Tokenizer::new(&remaining_query).peekable();
+        let mut previous_token_backslash = false;
+        let mut backslash_start = None;
+
+        while let Some(token) = tokenizer.next() {
+            match token {
+                Ok(token) => {
+                    let token_start = token.span.start as usize;
+                    let token_end = token.span.end as usize;
+                    let is_delimiter = token.text() == delimiter_text;
+                    let is_slash_g = if is_repl
+                        && previous_token_backslash
+                        && token.kind == TokenKind::Ident
+                        && token.text() == "G"
+                    {
+                        match tokenizer.peek() {
+                            Some(Ok(next)) => next.kind == TokenKind::EOI,
+                            None => true,
+                            Some(Err(_)) => false,
+                        }
+                    } else {
+                        false
+                    };
+
+                    if is_delimiter || is_slash_g {
+                        let statement_end = if is_slash_g {
+                            backslash_start.unwrap_or(token_start)
+                        } else {
+                            token_start
+                        };
+                        let sql = remaining_query[..statement_end].trim();
+                        if !sql.is_empty() {
+                            statements.push(sql.to_string());
+                        }
+                        remaining_query = remaining_query[token_end..].to_string();
+                        continue 'parser;
+                    }
+
+                    previous_token_backslash = token.kind == TokenKind::Backslash;
+                    backslash_start = previous_token_backslash.then_some(token_start);
+                }
+                Err(e) => {
+                    err = e.to_string();
+                    break 'parser;
+                }
+            }
+        }
+
+        break;
+    }
+
+    if !tail.is_empty() {
+        remaining_query.push_str(tail);
+    }
+
+    SplitResult {
+        statements,
+        remaining: remaining_query.trim().to_string(),
+        err,
+    }
+}
+
 /// Parse SQL text for web API (non-REPL mode)
 pub fn parse_sql_for_web(sql_text: &str) -> Vec<String> {
     let parser = SqlParser::new(';', true, false);
     parser.parse(sql_text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn split(s: &str) -> SplitResult {
+        split_statements(s, ';', false)
+    }
+
+    fn split_repl(s: &str) -> SplitResult {
+        split_statements(s, ';', true)
+    }
+
+    #[test]
+    fn basic_semicolon_split() {
+        let r = split("SELECT 1; SELECT 2;");
+        assert_eq!(r.statements, vec!["SELECT 1", "SELECT 2"]);
+        assert_eq!(r.remaining, "");
+    }
+
+    #[test]
+    fn semicolon_inside_single_quotes() {
+        let r = split("SELECT 'a;b';");
+        assert_eq!(r.statements, vec!["SELECT 'a;b'"]);
+        assert_eq!(r.remaining, "");
+    }
+
+    #[test]
+    fn single_quote_backslash_escape() {
+        let r = split(r"SELECT 'it\'s a;test';");
+        assert_eq!(r.statements, vec![r"SELECT 'it\'s a;test'"]);
+        assert_eq!(r.remaining, "");
+    }
+
+    #[test]
+    fn single_quote_backslash_escape_with_unicode() {
+        let r = split("SELECT 'a\\é;b';");
+        assert_eq!(r.statements, vec!["SELECT 'a\\é;b'"]);
+        assert_eq!(r.remaining, "");
+    }
+
+    #[test]
+    fn single_quote_doubled_escape() {
+        let r = split("SELECT 'it''s a;test';");
+        assert_eq!(r.statements, vec!["SELECT 'it''s a;test'"]);
+        assert_eq!(r.remaining, "");
+    }
+
+    #[test]
+    fn semicolon_inside_double_quotes() {
+        let r = split(r#"SELECT "a;b";"#);
+        assert_eq!(r.statements, vec![r#"SELECT "a;b""#]);
+        assert_eq!(r.remaining, "");
+    }
+
+    #[test]
+    fn double_quote_backslash_escape_with_unicode() {
+        let r = split("SELECT \"a\\é;b\";");
+        assert_eq!(r.statements, vec!["SELECT \"a\\é;b\""]);
+        assert_eq!(r.remaining, "");
+    }
+
+    #[test]
+    fn semicolon_inside_backticks() {
+        let r = split("SELECT `a;b`;");
+        assert_eq!(r.statements, vec!["SELECT `a;b`"]);
+        assert_eq!(r.remaining, "");
+    }
+
+    #[test]
+    fn semicolon_inside_dollar_quote() {
+        let r = split("SELECT $$a;b$$;");
+        assert_eq!(r.statements, vec!["SELECT $$a;b$$"]);
+        assert_eq!(r.remaining, "");
+    }
+
+    #[test]
+    fn semicolon_inside_block_comment() {
+        let r = split("SELECT /* ; */ 1;");
+        assert_eq!(r.statements, vec!["SELECT /* ; */ 1"]);
+        assert_eq!(r.remaining, "");
+    }
+
+    #[test]
+    fn semicolon_inside_line_comment() {
+        let r = split("SELECT 1 -- ;\n;");
+        assert_eq!(r.statements, vec!["SELECT 1 -- ;"]);
+        assert_eq!(r.remaining, "");
+    }
+
+    #[test]
+    fn unclosed_block_comment_repl() {
+        let r = split_repl("SELECT 1; /*");
+        assert_eq!(r.statements, vec!["SELECT 1"]);
+        assert_eq!(r.remaining, "/*");
+    }
+
+    #[test]
+    fn unclosed_single_quote_repl() {
+        let r = split_repl("SELECT '");
+        assert_eq!(r.statements, Vec::<String>::new());
+        assert_eq!(r.remaining, "SELECT '");
+    }
+
+    #[test]
+    fn unclosed_dollar_quote_repl() {
+        let r = split_repl("SELECT $$");
+        assert_eq!(r.statements, Vec::<String>::new());
+        assert_eq!(r.remaining, "SELECT $$");
+    }
+
+    #[test]
+    fn backslash_g_repl() {
+        let r = split_repl(r"SELECT 1\G");
+        assert_eq!(r.statements, vec!["SELECT 1"]);
+        assert_eq!(r.remaining, "");
+    }
+
+    #[test]
+    fn backslash_g_repl_requires_end_of_input() {
+        let r = split_repl(r"SELECT 1\Gfoo");
+        assert_eq!(r.statements, Vec::<String>::new());
+        assert_eq!(r.remaining, r"SELECT 1\Gfoo");
+    }
+
+    #[test]
+    fn backslash_g_non_repl_ignored() {
+        let r = split(r"SELECT 1\G;");
+        assert_eq!(r.statements, vec![r"SELECT 1\G"]);
+    }
+
+    #[test]
+    fn empty_input() {
+        let r = split("");
+        assert_eq!(r.statements, Vec::<String>::new());
+        assert_eq!(r.remaining, "");
+    }
+
+    #[test]
+    fn only_semicolons() {
+        let r = split(";;;");
+        assert_eq!(r.statements, Vec::<String>::new());
+        assert_eq!(r.remaining, "");
+    }
+
+    #[test]
+    fn only_whitespace() {
+        let r = split("   \n\t  ");
+        assert_eq!(r.statements, Vec::<String>::new());
+        assert_eq!(r.remaining, "");
+    }
+
+    #[test]
+    fn mixed_quotes_and_comments() {
+        let r = split("SELECT 'a' /* comment */ , \"b;c\" , `d;e`; SELECT $$f;g$$;");
+        assert_eq!(
+            r.statements,
+            vec![
+                "SELECT 'a' /* comment */ , \"b;c\" , `d;e`",
+                "SELECT $$f;g$$",
+            ]
+        );
+        assert_eq!(r.remaining, "");
+    }
+
+    #[test]
+    fn no_trailing_semicolon() {
+        let r = split("SELECT 1");
+        assert_eq!(r.statements, Vec::<String>::new());
+        assert_eq!(r.remaining, "SELECT 1");
+    }
+
+    #[test]
+    fn unclosed_block_comment_with_preceding_stmt() {
+        let r = split("SELECT 1; SELECT 2 /*");
+        assert_eq!(r.statements, vec!["SELECT 1"]);
+        assert_eq!(r.remaining, "SELECT 2 /*");
+    }
+
+    #[test]
+    fn delimiter_dollar_does_not_break_dollar_quote() {
+        let r = split_statements("SELECT $$a$b$$$", '$', false);
+        assert_eq!(r.statements, vec!["SELECT $$a$b$$"]);
+        assert_eq!(r.remaining, "");
+    }
+
+    #[test]
+    fn delimiter_dollar_does_not_break_placeholders_or_variables() {
+        let r = split_statements("SELECT $1 $", '$', false);
+        assert_eq!(r.statements, vec!["SELECT $1"]);
+        assert_eq!(r.remaining, "");
+
+        let r = split_statements("SELECT $foo $", '$', false);
+        assert_eq!(r.statements, vec!["SELECT $foo"]);
+        assert_eq!(r.remaining, "");
+    }
+
+    #[test]
+    fn delimiter_at_does_not_break_stage_literal() {
+        let r = split_statements("COPY INTO t FROM @~/stage/file @", '@', false);
+        assert_eq!(r.statements, vec!["COPY INTO t FROM @~/stage/file"]);
+        assert_eq!(r.remaining, "");
+    }
+
+    #[test]
+    fn delimiter_slash_does_not_break_block_comment() {
+        let r = split_statements("SELECT /* c */ 1/", '/', false);
+        assert_eq!(r.statements, vec!["SELECT /* c */ 1"]);
+        assert_eq!(r.remaining, "");
+    }
 }

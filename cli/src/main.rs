@@ -311,7 +311,7 @@ pub async fn main() -> Result<()> {
     if let Some(bind_port) = args.bind_port {
         settings.bind_port = bind_port;
     }
-    settings.merge_config(&config);
+    settings.merge_config(&config)?;
 
     // Set UI flag from command line
     settings.enable_ui = args.ui;

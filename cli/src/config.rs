@@ -163,7 +163,7 @@ impl From<ClapLoadMethod> for LoadMethod {
 }
 
 impl Settings {
-    pub fn merge_config(&mut self, c: &Config) {
+    pub fn merge_config(&mut self, c: &Config) -> Result<()> {
         let cfg = c.settings.clone();
 
         self.display_pretty_sql = cfg.display_pretty_sql.unwrap_or(self.display_pretty_sql);
@@ -180,7 +180,12 @@ impl Settings {
             .map(|expand| expand.as_str().into())
             .unwrap_or_else(|| self.expand);
         self.quote_string = cfg.quote_string.unwrap_or(self.quote_string);
-        self.sql_delimiter = cfg.sql_delimiter.unwrap_or(self.sql_delimiter);
+        if let Some(ch) = cfg.sql_delimiter {
+            Self::validate_delimiter(ch)?;
+            self.sql_delimiter = ch;
+        } else {
+            // keep current default
+        }
         self.max_width = cfg.max_width.unwrap_or(self.max_width);
         self.max_col_width = cfg.max_col_width.unwrap_or(self.max_col_width);
         self.max_display_rows = cfg.max_display_rows.unwrap_or(self.max_display_rows);
@@ -189,6 +194,29 @@ impl Settings {
         if self.bind_port == 0 {
             self.bind_port = c.server.bind_port;
         }
+        Ok(())
+    }
+
+    fn validate_delimiter(ch: char) -> Result<()> {
+        if !ch.is_ascii() {
+            return Err(anyhow!("SQL delimiter must be an ASCII character"));
+        }
+        if ch.is_ascii_whitespace() || ch.is_ascii_control() {
+            return Err(anyhow!(
+                "SQL delimiter cannot be whitespace or a control character"
+            ));
+        }
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            return Err(anyhow!(
+                "SQL delimiter cannot be a letter, digit, or underscore"
+            ));
+        }
+        if matches!(ch, '\'' | '"' | '`' | '\\') {
+            return Err(anyhow!(
+                "SQL delimiter cannot be a quote, backtick, or backslash"
+            ));
+        }
+        Ok(())
     }
 
     pub fn inject_ctrl_cmd(&mut self, cmd_name: &str, cmd_value: &str) -> Result<()> {
@@ -228,7 +256,9 @@ impl Settings {
                 if cmd_value.len() != 1 {
                     return Err(anyhow!("SQL delimiter must be a single character"));
                 }
-                self.sql_delimiter = cmd_value.chars().next().unwrap()
+                let ch = cmd_value.chars().next().unwrap();
+                Self::validate_delimiter(ch)?;
+                self.sql_delimiter = ch;
             }
             _ => return Err(anyhow!("Unknown command: {}", cmd_name)),
         }
@@ -333,6 +363,25 @@ impl Default for ServerConfig {
             bind_address: "127.0.0.1".to_string(),
             bind_port: 0,
             auto_open_browser: true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Settings;
+
+    #[test]
+    fn validate_delimiter_accepts_symbols() {
+        for ch in [';', ':', '@', '$', '#', '/', '|'] {
+            assert!(Settings::validate_delimiter(ch).is_ok(), "{ch:?}");
+        }
+    }
+
+    #[test]
+    fn validate_delimiter_rejects_conflicting_chars() {
+        for ch in ['a', 'Z', '0', '_', ' ', '\n', '\'', '"', '`', '\\', 'é'] {
+            assert!(Settings::validate_delimiter(ch).is_err(), "{ch:?}");
         }
     }
 }
