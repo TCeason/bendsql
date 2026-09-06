@@ -22,9 +22,9 @@ use tokio_stream::{Stream, StreamExt};
 use crate::error::{Error, Result};
 use crate::value::Value;
 use arrow::record_batch::RecordBatch;
+use chrono_tz::Tz as TimeZone;
 use databend_client::schema::SchemaRef;
 use databend_client::ResultFormatSettings;
-use jiff::tz::TimeZone;
 
 #[derive(Clone, Debug)]
 pub enum RowWithStats {

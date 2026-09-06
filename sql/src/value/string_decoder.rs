@@ -19,11 +19,11 @@ use crate::cursor_ext::{
     ReadNumberExt,
 };
 use crate::error::{ConvertError, Result};
-use chrono::{Datelike, NaiveDate};
+use chrono::{DateTime, Datelike, LocalResult, NaiveDate, NaiveDateTime, Offset, TimeZone as _};
+use chrono_tz::{GapInfo, Tz as TimeZone};
 use databend_client::schema::{DataType, DecimalDataType, DecimalSize, NumberDataType};
 use ethnum::i256;
 use hex;
-use jiff::{civil::DateTime as JiffDateTime, tz::TimeZone, Zoned};
 use serde::Deserialize;
 use serde_json::{value::RawValue, Deserializer};
 use std::io::{BufRead, Cursor};
@@ -105,7 +105,7 @@ impl TryFrom<(&DataType, String, &TimeZone)> for Value {
             }
             DataType::Timestamp => parse_timestamp(v.as_str(), tz),
             DataType::TimestampTz => {
-                let t = Zoned::strptime(TIMESTAMP_TIMEZONE_FORMAT, v.as_str())?;
+                let t = DateTime::parse_from_str(v.as_str(), TIMESTAMP_TIMEZONE_FORMAT)?;
                 Ok(Self::TimestampTz(t))
             }
             DataType::Date => Ok(Self::Date(
@@ -119,9 +119,7 @@ impl TryFrom<(&DataType, String, &TimeZone)> for Value {
             DataType::Interval => Ok(Self::Interval(v)),
             DataType::Array(_) | DataType::Map(_) | DataType::Tuple(_) | DataType::Vector(_) => {
                 let mut reader = Cursor::new(v.as_str());
-                let decoder = ValueDecoder {
-                    timezone: tz.clone(),
-                };
+                let decoder = ValueDecoder { timezone: *tz };
                 decoder.read_field(t, &mut reader)
             }
             DataType::Nullable(inner) => match inner.as_ref() {
@@ -322,7 +320,7 @@ impl ValueDecoder {
             reader.read_quoted_text(&mut buf, b'\'')?;
         }
         let v = unsafe { std::str::from_utf8_unchecked(&buf) };
-        let t = Zoned::strptime(TIMESTAMP_TIMEZONE_FORMAT, v)?;
+        let t = DateTime::parse_from_str(v, TIMESTAMP_TIMEZONE_FORMAT)?;
         Ok(Value::TimestampTz(t))
     }
 
@@ -499,13 +497,19 @@ impl ValueDecoder {
 }
 
 fn parse_timestamp(ts_string: &str, tz: &TimeZone) -> Result<Value> {
-    let local = JiffDateTime::strptime(TIMESTAMP_FORMAT, ts_string)?;
-    let dt_with_tz = local.to_zoned(tz.clone()).map_err(|e| {
-        Error::Parsing(format!(
-            "time {ts_string} not exists in timezone {tz:?}: {e}"
-        ))
-    })?;
-    Ok(Value::Timestamp(dt_with_tz))
+    let local = NaiveDateTime::parse_from_str(ts_string, TIMESTAMP_FORMAT)?;
+    // Preserve Jiff's compatible disambiguation: choose the earlier instant in
+    // a fold, and shift forward by the offset change in a gap (not necessarily
+    // one hour). HTTP timestamps have no offset to distinguish a fold.
+    let dt = match tz.from_local_datetime(&local) {
+        LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => Some(dt),
+        LocalResult::None => GapInfo::new(&local, tz)
+            .and_then(|gap| gap.begin)
+            .and_then(|(_, offset)| offset.fix().from_local_datetime(&local).single())
+            .map(|dt| dt.with_timezone(tz)),
+    }
+    .ok_or_else(|| Error::Parsing(format!("time {ts_string} not exists in timezone {tz}")))?;
+    Ok(Value::Timestamp(dt))
 }
 
 fn parse_decimal(text: &str, size: DecimalSize) -> Result<NumberValue> {

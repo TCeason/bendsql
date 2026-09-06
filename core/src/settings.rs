@@ -14,7 +14,7 @@
 
 use crate::error::Result;
 use crate::Error;
-use jiff::tz::TimeZone;
+use chrono_tz::Tz;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -22,14 +22,14 @@ use std::str::FromStr;
 #[derive(Debug, Clone)]
 pub struct ResultFormatSettings {
     pub geometry_output_format: GeometryDataType,
-    pub timezone: TimeZone,
+    pub timezone: Tz,
 }
 
 impl Default for ResultFormatSettings {
     fn default() -> Self {
         Self {
             geometry_output_format: GeometryDataType::default(),
-            timezone: TimeZone::UTC,
+            timezone: Tz::UTC,
         }
     }
 }
@@ -40,8 +40,8 @@ impl ResultFormatSettings {
             None => Ok(Default::default()),
             Some(settings) => {
                 let timezone = match settings.get("timezone") {
-                    None => TimeZone::UTC,
-                    Some(t) => TimeZone::get(t).map_err(|e| Error::Decode(e.to_string()))?,
+                    None => Tz::UTC,
+                    Some(t) => t.parse::<Tz>().map_err(|e| Error::Decode(e.to_string()))?,
                 };
 
                 let geometry_output_format = match settings.get("geometry_output_format") {

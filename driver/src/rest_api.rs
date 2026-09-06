@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use async_trait::async_trait;
-use jiff::tz::TimeZone;
+use chrono_tz::Tz as TimeZone;
 use log::info;
 use std::collections::{BTreeMap, VecDeque};
 use std::marker::PhantomData;

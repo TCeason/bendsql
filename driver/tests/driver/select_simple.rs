@@ -211,6 +211,30 @@ async fn select_datetime() {
 }
 
 #[tokio::test]
+async fn select_datetime_boundaries() {
+    let conn = prepare().await;
+    conn.exec("SET timezone = 'UTC'").await.unwrap();
+    let row = conn
+        .query_row(
+            "SELECT to_timestamp_tz('9999-12-31 23:59:59.999999 +0000'), \
+             DATE '9999-12-31' + INTERVAL 1 DAY, \
+             add_years(TIMESTAMP '9999-12-31 23:59:59.999999', 1001)",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let values = row.values();
+    assert_eq!(values[0].to_string(), "9999-12-31 23:59:59.999999 +0000");
+    assert_eq!(values[1].to_string(), "+10000-01-01 00:00:00.000000");
+    assert_eq!(values[2].to_string(), "+11000-12-31 23:59:59.999999");
+    let (z, ts, upper): (DateTime<chrono::FixedOffset>, DateTime<Tz>, NaiveDateTime) =
+        row.try_into().unwrap();
+    assert_eq!(z.timestamp_micros(), 253_402_300_799_999_999);
+    assert_eq!(ts.timestamp_micros(), 253_402_300_800_000_000);
+    assert_eq!(upper.and_utc().timestamp_micros(), 284_990_831_999_999_999);
+}
+
+#[tokio::test]
 async fn select_decimal() {
     let conn = prepare().await;
     let row = conn
